@@ -12,6 +12,9 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 
+import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -34,7 +37,22 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private val semaphore = Semaphore(rateLimitPerSec) // Семафор для ограничения количества запросов
+    private val scheduler = Executors.newScheduledThreadPool(1) // Планировщик для сброса семафора
+
+    init {
+        // Обновление семафора каждую секунду
+        scheduler.scheduleAtFixedRate({
+            semaphore.release(rateLimitPerSec)
+        }, 0, 1, TimeUnit.SECONDS)
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        if (!semaphore.tryAcquire()) { // Проверяем можем ли мы выполнить запрос
+            logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
+            return // Прерываем выполнение метода если лимит превышен
+        }
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -85,6 +103,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            semaphore.release() // Освобождаем семафор после завершения запроса
         }
     }
 
