@@ -3,5 +3,5 @@ Content-Type: application/json
 
 {
   "ratePerSecond": 11,
-  "testCount": 2
+  "testCount": 1200
 }
