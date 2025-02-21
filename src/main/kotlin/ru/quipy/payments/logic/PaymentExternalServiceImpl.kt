@@ -6,12 +6,12 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -33,8 +33,10 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
+    private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), requestAverageProcessingTime, parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        rateLimiter.tick() // Дожидаемся свободного слота в лимитере
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
