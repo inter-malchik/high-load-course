@@ -9,7 +9,6 @@ import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 
 class LeakingBucketRateLimiter(
     private val rate: Long,
@@ -21,7 +20,7 @@ class LeakingBucketRateLimiter(
 
     override fun tick() : Boolean {
         while (true) {
-            if (queue.offer(Unit, 1, TimeUnit.SECONDS)) {
+            if (queue.offer(Unit)) {
                 return true
             }
         }
