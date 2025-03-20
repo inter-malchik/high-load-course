@@ -12,12 +12,14 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 private const val paymentUrl = "http://localhost:1234/external/process"
@@ -40,10 +42,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder().callTimeout((requestAverageProcessingTime.toMillis() * 1.1).toLong(), TimeUnit.MILLISECONDS).build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
-    private val retryTimeout = Duration.ofSeconds(1)
+    private val retryTimeout = ofSeconds(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         semaphore.acquire()
@@ -70,7 +72,7 @@ class PaymentExternalSystemAdapterImpl(
                     now() <= deadline && (!response.result || response.code == HttpStatus.TOO_MANY_REQUESTS_429)
                 }
                 .retryOnException { exception ->
-                    (exception is SocketTimeoutException) && (now() <= deadline)
+                    (exception is SocketTimeoutException || exception is InterruptedIOException) && (now() <= deadline)
                 }
                 .failAfterMaxAttempts(true)
                 .build()
