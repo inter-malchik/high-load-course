@@ -19,6 +19,7 @@ import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 private const val paymentUrl = "http://localhost:1234/external/process"
@@ -41,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().callTimeout(ofMillis(1300)).build()
+    private val client = OkHttpClient.Builder().callTimeout((requestAverageProcessingTime.toMillis() * 1.1).toLong(), TimeUnit.MILLISECONDS).build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
     private val retryTimeout = ofSeconds(1)
