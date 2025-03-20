@@ -7,11 +7,13 @@ import io.github.resilience4j.retry.RetryConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import org.eclipse.jetty.http.HttpStatus
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
+import java.time.Duration
 import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
@@ -41,6 +43,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
+    private val retryTimeout = Duration.ofSeconds(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         semaphore.acquire()
@@ -62,17 +65,9 @@ class PaymentExternalSystemAdapterImpl(
 
             val localRetryConfig = RetryConfig.custom<ExternalSysResponse>()
                 .maxAttempts(5)
-                .intervalFunction { attempt ->
-                    when (attempt) {
-                        1 -> ofMillis(100).toMillis()
-                        2 -> ofMillis(500).toMillis()
-                        3 -> ofSeconds(1).toMillis()
-                        4 -> ofSeconds(2).toMillis()
-                        else -> ofSeconds(5).toMillis()
-                    }
-                }
+                .waitDuration(retryTimeout)
                 .retryOnResult { response: ExternalSysResponse ->
-                    now() <= deadline && !response.result
+                    now() <= deadline && (!response.result || response.code == HttpStatus.TOO_MANY_REQUESTS_429)
                 }
                 .retryOnException { exception ->
                     (exception is SocketTimeoutException) && (now() <= deadline)
@@ -85,13 +80,16 @@ class PaymentExternalSystemAdapterImpl(
             val decoratedCall = Retry.decorateCallable(localRetry) {
                 client.newCall(request).execute().use { response ->
                     val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        var readValue = mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        readValue.code = response.code
+                        readValue
                     } catch (e: Exception) {
                         logger.error(
                             "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
                                     "result code: ${response.code}, reason: ${response.body?.string()}"
                         )
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message,
+                            response.code)
                     }
                     logger.warn(
                         "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
