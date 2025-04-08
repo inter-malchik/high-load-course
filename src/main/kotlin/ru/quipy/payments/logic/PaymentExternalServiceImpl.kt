@@ -10,7 +10,6 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration.ofMillis
@@ -42,19 +41,18 @@ class PaymentExternalSystemAdapterImpl(
     private var CALL_TIMEOUT_MULT = 2.5
 
     private val client = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply { maxRequests = parallelRequests })
         .readTimeout(ofSeconds(30))
         .writeTimeout(ofSeconds(30))
         .callTimeout((requestAverageProcessingTime.toMillis() * CALL_TIMEOUT_MULT).toLong(), TimeUnit.MILLISECONDS)
         .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
-        .connectionPool(ConnectionPool(256, 5, TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(2048, 5, TimeUnit.MINUTES))
         .build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
     private val retryTimeout = ofSeconds(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-//        semaphore.acquire()
+        semaphore.acquire()
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
         try {
@@ -85,42 +83,33 @@ class PaymentExternalSystemAdapterImpl(
 
             val localRetry = Retry.of("payment-${transactionId}", localRetryConfig)
 
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    val errorResult = ExternalSysResponse(
-                        transactionId = transactionId.toString(),
-                        paymentId = paymentId.toString(),
-                        result = false,
-                        message = e.message,
-                        code = 500
-                    )
-                    logger.error("[$accountName] [ERROR] Payment processing failed for txId: $transactionId, payment: $paymentId. Error: ${e.message}")
-                    handlePaymentResult(paymentId, transactionId, errorResult)
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    response.use {
-                        val body = try {
-                            var readValue = mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                            readValue.code = response.code
-                            readValue
-                        } catch (e: Exception) {
-                            logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                        "result code: ${response.code}, reason: ${response.body?.string()}"
-                            )
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message,
-                                response.code)
-                        }
-
-                        logger.warn(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                    "succeeded: ${body.result}, message: ${body.message}"
+            val decoratedCall = Retry.decorateCallable(localRetry) {
+                client.newCall(request).execute().use { response ->
+                    val body = try {
+                        var readValue = mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        readValue.code = response.code
+                        readValue
+                    } catch (e: Exception) {
+                        logger.error(
+                            "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                                    "result code: ${response.code}, reason: ${response.body?.string()}"
                         )
-                        handlePaymentResult(paymentId, transactionId, body)
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message,
+                            response.code)
                     }
+                    logger.warn(
+                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                                "succeeded: ${body.result}, message: ${body.message}"
+                    )
+                    body
                 }
-            })
+            }
+
+            val result: ExternalSysResponse = decoratedCall.call()
+
+            paymentESService.update(paymentId) {
+                it.logProcessing(result.result, now(), transactionId, reason = result.message)
+            }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
@@ -142,21 +131,13 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    fun handlePaymentResult(
-        paymentId: UUID,
-        transactionId: UUID,
-        result: ExternalSysResponse
-    ) {
-        paymentESService.update(paymentId) {
-            it.logProcessing(result.result, now(), transactionId, reason = result.message)
-        }
-    }
 
     override fun price() = properties.price
 
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
 }
 
 fun now() = System.currentTimeMillis()
