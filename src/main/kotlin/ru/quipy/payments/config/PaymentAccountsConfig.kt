@@ -3,6 +3,8 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
@@ -13,6 +15,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import java.util.concurrent.ExecutorService
 
 
 @Configuration
@@ -24,6 +27,10 @@ class PaymentAccountsConfig {
     }
 
     private val allowedAccounts = setOf("acc-12")
+
+    @Autowired
+    @Qualifier("http")
+    private lateinit var httpExecutor: ExecutorService
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
@@ -42,6 +49,6 @@ class PaymentAccountsConfig {
             .filter {
                 it.accountName in allowedAccounts
             }.onEach(::println)
-            .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
+            .map { PaymentExternalSystemAdapterImpl(it, paymentService, httpExecutor) }
     }
 }
