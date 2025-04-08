@@ -4,9 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.retry.Retry
 import io.github.resilience4j.retry.RetryConfig
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.eclipse.jetty.http.HttpStatus
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
@@ -43,7 +41,11 @@ class PaymentExternalSystemAdapterImpl(
     private var CALL_TIMEOUT_MULT = 2.5
 
     private val client = OkHttpClient.Builder()
+        .readTimeout(ofSeconds(30))
+        .writeTimeout(ofSeconds(30))
         .callTimeout((requestAverageProcessingTime.toMillis() * CALL_TIMEOUT_MULT).toLong(), TimeUnit.MILLISECONDS)
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+        .connectionPool(ConnectionPool(2048, 5, TimeUnit.MINUTES))
         .build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
