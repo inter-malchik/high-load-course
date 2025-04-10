@@ -28,10 +28,6 @@ class PaymentAccountsConfig {
 
     private val allowedAccounts = setOf("acc-12")
 
-    @Autowired
-    @Qualifier("http")
-    private lateinit var httpExecutor: ExecutorService
-
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
@@ -49,6 +45,6 @@ class PaymentAccountsConfig {
             .filter {
                 it.accountName in allowedAccounts
             }.onEach(::println)
-            .map { PaymentExternalSystemAdapterImpl(it, paymentService, httpExecutor) }
+            .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
     }
 }

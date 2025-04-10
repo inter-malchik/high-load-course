@@ -16,18 +16,9 @@ public class ExecutorConfig {
     @Bean
     @Qualifier("payment")
     public ExecutorService executorServicePayment(MeterRegistry meterRegistry) {
-        ExecutorService executorService = Executors.newFixedThreadPool(1024, new BasicThreadFactory.Builder()
+        ExecutorService executorService = Executors.newFixedThreadPool(128, new BasicThreadFactory.Builder()
             .namingPattern("payment-exec-%d").priority(Thread.MAX_PRIORITY).build());
         ExecutorServiceMetrics.monitor(meterRegistry, executorService, "payment-exec");
-        return executorService;
-    }
-
-    @Bean
-    @Qualifier("http")
-    public ExecutorService executorServiceHttp(MeterRegistry meterRegistry) {
-        ExecutorService executorService = Executors.newFixedThreadPool(2048, new BasicThreadFactory.Builder()
-                .namingPattern("http-exec-%d").priority(Thread.MAX_PRIORITY).build());
-        ExecutorServiceMetrics.monitor(meterRegistry, executorService, "http-exec");
         return executorService;
     }
 }
