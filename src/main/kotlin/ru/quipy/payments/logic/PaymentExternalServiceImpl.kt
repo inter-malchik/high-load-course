@@ -4,9 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.retry.Retry
 import io.github.resilience4j.retry.RetryConfig
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import org.eclipse.jetty.http.HttpStatus
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LeakingBucketRateLimiter
@@ -14,11 +11,17 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
+import java.util.concurrent.CompletionStage
+import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
+import java.util.function.Supplier
 
 
 private const val paymentUrl = "http://localhost:1234/external/process"
@@ -26,12 +29,11 @@ private const val paymentUrl = "http://localhost:1234/external/process"
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
-    private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
+    private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-        val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
@@ -40,14 +42,14 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private var CALL_TIMEOUT_MULT = 2.5
 
-    private val client = OkHttpClient.Builder()
-        .callTimeout((requestAverageProcessingTime.toMillis() * CALL_TIMEOUT_MULT).toLong(), TimeUnit.MILLISECONDS)
+    private val httpClient = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_2)
         .build()
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
     private val retryTimeout = ofSeconds(1)
+    private val retryExecutor = Executors.newSingleThreadScheduledExecutor()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         semaphore.acquire()
@@ -61,11 +63,6 @@ class PaymentExternalSystemAdapterImpl(
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), ofMillis(now() - paymentStartedAt))
             }
-
-            val request = Request.Builder().run {
-                url("$paymentUrl?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
 
             val localRetryConfig = RetryConfig.custom<ExternalSysResponse>()
                 .maxAttempts(5)
@@ -81,33 +78,47 @@ class PaymentExternalSystemAdapterImpl(
 
             val localRetry = Retry.of("payment-${transactionId}", localRetryConfig)
 
-            val decoratedCall = Retry.decorateCallable(localRetry) {
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        var readValue = mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                        readValue.code = response.code
+            var httpRequest = HttpRequest
+                .newBuilder()
+                .uri(URI("$paymentUrl?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
+
+            val httpCallSupplier = Supplier<CompletionStage<HttpResponse<String>>> {
+                httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
+            }
+
+            val retryable = Retry.decorateCompletionStage(
+                localRetry,
+                retryExecutor,
+                httpCallSupplier
+            ).get()
+
+            retryable
+                .thenApply { response ->
+                    try {
+                        val readValue = mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                        readValue.code = response.statusCode()
                         readValue
                     } catch (e: Exception) {
                         logger.error(
                             "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                    "result code: ${response.code}, reason: ${response.body?.string()}"
+                                    "result code: ${response.statusCode()}, reason: ${response.body()}"
                         )
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message,
-                            response.code)
+                        ExternalSysResponse(
+                            transactionId.toString(),
+                            paymentId.toString(),
+                            false,
+                            e.message,
+                            response.statusCode()
+                        )
                     }
-                    logger.warn(
-                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                "succeeded: ${body.result}, message: ${body.message}"
-                    )
-                    body
                 }
-            }
-
-            val result: ExternalSysResponse = decoratedCall.call()
-
-            paymentESService.update(paymentId) {
-                it.logProcessing(result.result, now(), transactionId, reason = result.message)
-            }
+                .thenApply { response ->
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(response.result, now(), transactionId, reason = response.message)
+                    }
+                }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
