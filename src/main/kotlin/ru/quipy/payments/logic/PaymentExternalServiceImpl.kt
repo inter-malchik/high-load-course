@@ -18,8 +18,10 @@ import java.net.http.HttpResponse
 import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
+import java.util.concurrent.CompletionStage
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
+import java.util.function.Supplier
 
 
 private const val paymentUrl = "http://localhost:1234/external/process"
@@ -47,6 +49,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), ofSeconds(1), rateLimitPerSec)
     private val semaphore = Semaphore(parallelRequests)
     private val retryTimeout = ofSeconds(1)
+    private val retryExecutor = Executors.newSingleThreadScheduledExecutor()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         semaphore.acquire()
@@ -81,29 +84,41 @@ class PaymentExternalSystemAdapterImpl(
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
 
-            Retry.decorateCompletionStage(localRetry, Executors.newScheduledThreadPool(128)) {
+            val httpCallSupplier = Supplier<CompletionStage<HttpResponse<String>>> {
                 httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
-                    .thenApply { response ->
-                        try {
-                            var readValue = mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                            readValue.code = response.statusCode()
-                            readValue
-                        } catch (e: Exception) {
-                            logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                        "result code: ${response.statusCode()}, reason: ${response.body()}"
-                            )
-                            ExternalSysResponse(
-                                transactionId.toString(), paymentId.toString(), false, e.message,
-                                response.statusCode()
-                            )
-                        }
-                    }.thenApply { response ->
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(response.result, now(), transactionId, reason = response.message)
-                        }
-                    }
             }
+
+            val retryable = Retry.decorateCompletionStage(
+                localRetry,
+                retryExecutor,
+                httpCallSupplier
+            ).get()
+
+            retryable
+                .thenApply { response ->
+                    try {
+                        val readValue = mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                        readValue.code = response.statusCode()
+                        readValue
+                    } catch (e: Exception) {
+                        logger.error(
+                            "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                                    "result code: ${response.statusCode()}, reason: ${response.body()}"
+                        )
+                        ExternalSysResponse(
+                            transactionId.toString(),
+                            paymentId.toString(),
+                            false,
+                            e.message,
+                            response.statusCode()
+                        )
+                    }
+                }
+                .thenApply { response ->
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(response.result, now(), transactionId, reason = response.message)
+                    }
+                }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
