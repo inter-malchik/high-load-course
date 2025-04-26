@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.stereotype.Service
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -21,6 +22,7 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     @Autowired
+    @Qualifier("payment")
     private lateinit var paymentExecutor: ExecutorService
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
